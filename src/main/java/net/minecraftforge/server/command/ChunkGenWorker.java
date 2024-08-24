@@ -3,22 +3,23 @@
  * SPDX-License-Identifier: LGPL-2.1-only
  */
 
+
 package net.minecraftforge.server.command;
+
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.chunk.ChunkAccess;
+import net.minecraft.core.BlockPos;
+import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.network.chat.Component;
+import net.minecraftforge.common.WorldWorkerManager.IWorker;
 
 import java.util.ArrayDeque;
 import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
-import net.minecraft.commands.CommandSourceStack;
-import net.minecraft.core.BlockPos;
-import net.minecraft.network.chat.Component;
-import net.minecraft.network.chat.MutableComponent;
-import net.minecraft.server.level.ServerLevel;
-import net.minecraft.world.level.chunk.ChunkStatus;
-import net.minecraft.world.level.chunk.ChunkAccess;
-import net.minecraftforge.common.WorldWorkerManager.IWorker;
-
-public class ChunkGenWorker implements IWorker
-{
+public class ChunkGenWorker implements IWorker {
     private final CommandSourceStack listener;
     protected final BlockPos start;
     protected final int total;
@@ -26,30 +27,28 @@ public class ChunkGenWorker implements IWorker
     private final Queue<BlockPos> queue;
     private final int notificationFrequency;
     private int lastNotification = 0;
-    private long lastNotifcationTime = 0;
+    private long lastNotificationTime = 0;
     private int genned = 0;
-    private Boolean keepingLoaded;
+    private final ExecutorService executor;
 
-    public ChunkGenWorker(CommandSourceStack listener, BlockPos start, int total, ServerLevel dim, int interval)
-    {
+    public ChunkGenWorker(CommandSourceStack listener, BlockPos start, int total, ServerLevel dim, int interval, int numThreads) {
         this.listener = listener;
         this.start = start;
         this.total = total;
-        this.dim  = dim;
-        this.queue = buildQueue();
-        this.notificationFrequency = interval != -1 ? interval : Math.max(total / 20, 100); //Every 5% or every 100, whichever is more.
-        this.lastNotifcationTime = System.currentTimeMillis(); //We also notify at least once every 60 seconds, to show we haven't froze.
+        this.dim = dim;
+        this.queue = new ConcurrentLinkedQueue<>(buildQueue()); // Use a thread-safe queue
+        this.notificationFrequency = interval != -1 ? interval : Math.max(total / 20, 100);
+        this.lastNotificationTime = System.currentTimeMillis();
+        this.executor = Executors.newFixedThreadPool(numThreads); // Create a thread pool
     }
 
-    protected Queue<BlockPos> buildQueue()
-    {
-        Queue<BlockPos> ret = new ArrayDeque<BlockPos>();
+    protected Queue<BlockPos> buildQueue() {
+        Queue<BlockPos> ret = new ArrayDeque<>();
         ret.add(start);
 
-        //This *should* spiral outwards, starting on right side, down, left, up, right, but hey we'll see!
+        // Spiral outwards starting from the center
         int radius = 1;
-        while (ret.size() < total)
-        {
+        while (ret.size() < total) {
             for (int q = -radius + 1; q <= radius && ret.size() < total; q++)
                 ret.add(start.offset(radius, 0, q));
 
@@ -67,72 +66,48 @@ public class ChunkGenWorker implements IWorker
         return ret;
     }
 
-    public MutableComponent getStartMessage(CommandSourceStack sender)
-    {
+    public Component getStartMessage(CommandSourceStack sender) {
         return Component.translatable("commands.forge.gen.start", total, start.getX(), start.getZ(), dim);
     }
 
     @Override
-    public boolean hasWork()
-    {
-        return queue.size() > 0;
+    public boolean hasWork() {
+        return !queue.isEmpty();
     }
 
     @Override
-    public boolean doWork()
-    {
-        /* TODO: Check how many things are pending save, and slow down world gen if to many
-        AnvilChunkLoader loader = dim.getChunkProvider().chunkLoader instanceof AnvilChunkLoader ? (AnvilChunkLoader)world.getChunkProvider().chunkLoader : null;
-        if (loader != null && loader.getPendingSaveCount() > 100)
-        {
-
-            if (lastNotifcationTime < System.currentTimeMillis() - 10*1000)
-            {
-                listener.sendFeedback(new TranslationTextComponent("commands.forge.gen.progress", total - queue.size(), total), true);
-                lastNotifcationTime = System.currentTimeMillis();
-            }
-            return false;
+    public boolean doWork() {
+        while (hasWork()) {
+            executor.submit(this::generateChunk);
         }
-        */
 
+        executor.shutdown();
+        return true;
+    }
+
+    private void generateChunk() {
         BlockPos next = queue.poll();
-
-        if (next != null)
-        {
-            // While we work we don't want to cause world load spam so pause unloading the world.
-            /* TODO: Readd if/when we introduce world unloading, or get Mojang to do it.
-            if (keepingLoaded == null)
-                keepingLoaded = DimensionManager.keepLoaded(dim, true);
-            */
-
-            if (++lastNotification >= notificationFrequency || lastNotifcationTime < System.currentTimeMillis() - 60*1000)
-            {
-                listener.sendSuccess(Component.translatable("commands.forge.gen.progress", total - queue.size(), total), true);
-                lastNotification = 0;
-                lastNotifcationTime = System.currentTimeMillis();
-            }
-
+        if (next != null) {
             int x = next.getX();
             int z = next.getZ();
 
-            if (!dim.hasChunk(x, z)) { //Chunk is unloaded
-                ChunkAccess chunk = dim.getChunk(x, z, ChunkStatus.EMPTY, true);
-                if (!chunk.getStatus().isOrAfter(ChunkStatus.FULL)) {
-                    chunk = dim.getChunk(x, z, ChunkStatus.FULL);
-                    genned++; //There isn't a way to check if the chunk is actually created just if it was loaded
+            ChunkAccess chunk = dim.getChunkSource().getChunk(x, z, false); // Modify as necessary
+
+            if (chunk != null) {
+                genned++;
+            }
+
+            synchronized (this) {
+                if (++lastNotification >= notificationFrequency || lastNotificationTime < System.currentTimeMillis() - 60 * 1000) {
+                    listener.sendSuccess(Component.translatable("commands.forge.gen.progress", total - queue.size(), total), true);
+                    lastNotification = 0;
+                    lastNotificationTime = System.currentTimeMillis();
                 }
             }
         }
 
-        if (queue.size() == 0)
-        {
+        if (queue.isEmpty()) {
             listener.sendSuccess(Component.translatable("commands.forge.gen.complete", genned, total, dim.dimension().location()), true);
-            /* TODO: Readd if/when we introduce world unloading, or get Mojang to do it.
-            if (keepingLoaded != null && !keepingLoaded)
-                DimensionManager.keepLoaded(dim, false);
-            */
-            return false;
         }
-        return true;
     }
 }
